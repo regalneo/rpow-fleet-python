@@ -45,6 +45,7 @@ COOKIES_FILE = "cookies_bulk.txt"
 
 LOG_LOCK = threading.Lock()
 FILE_LOCK = threading.Lock()
+CHROME_LOCK = threading.Lock()  # serialize Chrome verify since uc driver can't share binary
 STATS = {"ok": 0, "fail": 0, "started_at": time.time()}
 
 ADJ = ("amber arctic azure bold brave breezy bright bronze calm classic clever "
@@ -227,49 +228,50 @@ def poll_magic_link(email_addr, max_wait_s=MAIL_WAIT_S):
 
 def verify_and_get_session_chrome(verify_url):
     """Visit verify URL in Chrome (handles Cloudflare JS challenge) and extract rpow_session."""
-    driver = None
-    try:
-        driver = new_chrome_driver()
-        driver.get(verify_url)
-        time.sleep(6)  # Let Cloudflare challenge settle
-
-        for ck in driver.get_cookies():
-            if ck["name"] == "rpow_session":
-                val = urllib.parse.unquote(ck["value"])
-                driver.quit()
-                return val
-
-        # Try JSON body
+    with CHROME_LOCK:
+        driver = None
         try:
-            body = driver.find_element("tag name", "body").text
-            j = json.loads(body)
-            for key in ("rpow_session", "session", "token"):
-                if key in j:
-                    val = j[key]
+            driver = new_chrome_driver()
+            driver.get(verify_url)
+            time.sleep(6)  # Let Cloudflare challenge settle
+
+            for ck in driver.get_cookies():
+                if ck["name"] == "rpow_session":
+                    val = urllib.parse.unquote(ck["value"])
                     driver.quit()
                     return val
-        except Exception:
-            pass
 
-        # Try URL query param
-        parsed = urllib.parse.urlparse(driver.current_url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        for key in ("s", "token", "session"):
-            if key in qs:
-                val = qs[key][0]
-                driver.quit()
-                return val
-
-        driver.quit()
-        return None
-    except Exception as ex:
-        log(f"[verify Chrome] error: {ex}")
-        if driver:
+            # Try JSON body
             try:
-                driver.quit()
+                body = driver.find_element("tag name", "body").text
+                j = json.loads(body)
+                for key in ("rpow_session", "session", "token"):
+                    if key in j:
+                        val = j[key]
+                        driver.quit()
+                        return val
             except Exception:
                 pass
-        return None
+
+            # Try URL query param
+            parsed = urllib.parse.urlparse(driver.current_url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            for key in ("s", "token", "session"):
+                if key in qs:
+                    val = qs[key][0]
+                    driver.quit()
+                    return val
+
+            driver.quit()
+            return None
+        except Exception as ex:
+            log(f"[verify Chrome] error: {ex}")
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            return None
 
 
 def append_account(rec):
