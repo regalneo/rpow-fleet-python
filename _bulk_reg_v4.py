@@ -1,12 +1,11 @@
-"""Bulk register rpow2.com accounts — curl_cffi for /auth/request + Chrome for verify.
+"""Bulk register rpow2.com accounts — curl_cffi TLS impersonation + Chrome for verify.
 
-Strategy:
-  - CapSolver Turnstile token + curl_cffi Chrome TLS impersonation -> POST /auth/request
-  - Chrome browser visits verify URL (Cloudflare challenge must pass in real browser)
-  - Email polling via Gmail IMAP (search by Subject)
+Login / dashboard fetcher included — run with --login to authenticate with a session token
+and fetch wallet/reward info.
 
 Usage:
-    python _bulk_reg_v4.py <target> [<parallel>]
+    python _bulk_reg_v4.py <target> [<parallel>]          # register accounts
+    python _bulk_reg_v4.py --login <session_token>        # login + fetch dashboard
 
 Env vars:
     CAPSOLVER_KEY, RPOW_DOMAIN, PROXY_HOST, PROXY_PORT,
@@ -45,7 +44,7 @@ COOKIES_FILE = "cookies_bulk.txt"
 
 LOG_LOCK = threading.Lock()
 FILE_LOCK = threading.Lock()
-CHROME_LOCK = threading.Lock()  # serialize Chrome verify since uc driver can't share binary
+CHROME_LOCK = threading.Lock()
 STATS = {"ok": 0, "fail": 0, "started_at": time.time()}
 
 ADJ = ("amber arctic azure bold brave breezy bright bronze calm classic clever "
@@ -233,7 +232,7 @@ def verify_and_get_session_chrome(verify_url):
         try:
             driver = new_chrome_driver()
             driver.get(verify_url)
-            time.sleep(6)  # Let Cloudflare challenge settle
+            time.sleep(6)
 
             for ck in driver.get_cookies():
                 if ck["name"] == "rpow_session":
@@ -241,7 +240,6 @@ def verify_and_get_session_chrome(verify_url):
                     driver.quit()
                     return val
 
-            # Try JSON body
             try:
                 body = driver.find_element("tag name", "body").text
                 j = json.loads(body)
@@ -253,7 +251,6 @@ def verify_and_get_session_chrome(verify_url):
             except Exception:
                 pass
 
-            # Try URL query param
             parsed = urllib.parse.urlparse(driver.current_url)
             qs = urllib.parse.parse_qs(parsed.query)
             for key in ("s", "token", "session"):
@@ -336,7 +333,125 @@ def worker(wid):
     return rec
 
 
+def login_and_fetch_dashboard(session_token):
+    """Log into rpow2.com using a session token and fetch dashboard/wallet info.
+    Uses Chrome to handle Cloudflare JS challenge on the dashboard page."""
+    with CHROME_LOCK:
+        driver = None
+        try:
+            driver = new_chrome_driver()
+            # Set the session cookie directly to authenticate
+            driver.get(PAGE_URL)
+            time.sleep(2)
+            driver.add_cookie({
+                "name": "rpow_session",
+                "value": session_token,
+                "domain": ".rpow2.com",
+                "path": "/",
+            })
+            driver.get(f"{PAGE_URL}dashboard")
+            time.sleep(6)
+
+            # Extract page text
+            try:
+                body = driver.find_element("tag name", "body").text
+            except Exception:
+                body = ""
+
+            # Try to get any API data from localStorage/sessionStorage
+            try:
+                stats_raw = driver.execute_script("return localStorage.getItem('rpow_stats') || sessionStorage.getItem('rpow_stats') || '';")
+            except Exception:
+                stats_raw = ""
+
+            # Try JSON API call
+            try:
+                driver.get(f"{RPOW_API}/user/info")
+                time.sleep(3)
+                info_body = driver.find_element("tag name", "body").text
+            except Exception:
+                info_body = ""
+
+            driver.quit()
+            driver = None
+
+            return {
+                "session_token": session_token,
+                "page_body": body[:2000],
+                "stats_raw": stats_raw,
+                "api_body": info_body[:2000],
+            }
+        except Exception as ex:
+            log(f"[login] error: {ex}")
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            return None
+
+
+def cmd_login():
+    """Handle --login <session_token> or --login (interactive from accounts file)."""
+    if len(sys.argv) >= 3:
+        token = sys.argv[2]
+    else:
+        # Interactive: use first account from accounts file
+        try:
+            with open(ACCOUNTS_FILE, "r") as f:
+                first = json.loads(f.readline())
+                token = first["rpow_session"]
+                log(f"Using session from {first['email']}")
+        except Exception as ex:
+            log(f"Could not read {ACCOUNTS_FILE}: {ex}")
+            return
+
+    log(f"Logging in with session: {token[:20]}...")
+    result = login_and_fetch_dashboard(token)
+    if not result:
+        log("Login failed")
+        return
+
+    print("\n" + "="*60)
+    print("DASHBOARD INFO")
+    print("="*60)
+    print(f"\nPage body:\n{result['page_body'][:1500]}")
+    if result['stats_raw']:
+        print(f"\nLocalStorage stats:\n{result['stats_raw'][:500]}")
+    if result['api_body']:
+        print(f"\nAPI /user/info response:\n{result['api_body'][:1000]}")
+    print("="*60)
+
+
+def cmd_stats():
+    """Show stats from accounts file."""
+    try:
+        with open(ACCOUNTS_FILE, "r") as f:
+            lines = f.readlines()
+        unique_tokens = set()
+        emails = []
+        for line in lines:
+            rec = json.loads(line)
+            emails.append(rec['email'])
+            unique_tokens.add(rec['rpow_session'])
+        print(f"Total accounts: {len(emails)}")
+        print(f"Unique sessions: {len(unique_tokens)}")
+        print(f"Accounts per session: {len(emails)/max(len(unique_tokens),1):.1f}")
+        print("\nAll emails:")
+        for e in emails:
+            print(f"  {e}")
+    except Exception as ex:
+        print(f"Error: {ex}")
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--login":
+        cmd_login()
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "--stats":
+        cmd_stats()
+        return
+
     target = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     parallel = int(sys.argv[2]) if len(sys.argv) > 2 else 2
     log(f"target={target} parallel={parallel} domain={EMAIL_DOMAIN}")
